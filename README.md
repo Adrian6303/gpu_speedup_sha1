@@ -35,6 +35,13 @@ process times plus the GPU kernel time:
 .\benchmark.ps1 -Attempts 5000000 -Runs 5
 ```
 
+Benchmark hardware:
+
+- CPU: 12th Gen Intel Core i7-12700H, 14 cores / 20 logical processors,
+  2.30 GHz base speed.
+- GPU: NVIDIA GeForce RTX 3050 Ti Laptop GPU, 2,560 CUDA cores,
+  4.0 GB dedicated and 7.8 GB shared GPU memory.
+
 RTX 3050 Ti results, five runs; CPU is single-threaded. Process timings include
 startup and CUDA initialization; kernel time excludes startup:
 
