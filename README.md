@@ -1,64 +1,147 @@
-# SHA-1 CPU and CUDA
+# SHA-1 proof-of-work search: sequential C, threaded C, and CUDA
 
-Educational project that searches candidate strings for a SHA-1 digest ending
-in a chosen hexadecimal suffix, and compares CPU and CUDA performance. Do not
-use SHA-1 for security-sensitive applications.
+This project searches for a 64-bit nonce `n` such that:
 
-## Run CPU tests
+```text
+SHA1(B || LE64(n))
+```
 
-Use the VS 2022 Developer PowerShell terminal:
+ends in a chosen lowercase hexadecimal suffix. `B` is an arbitrary byte
+sequence, `||` means concatenation, and `LE64(n)` is the nonce encoded as
+exactly 8 little-endian bytes. The nonce range and input are identical for the
+sequential C, OpenMP C, and CUDA implementations. Each version examines the
+entire requested range and reports the lowest matching nonce; none stops early
+when a match is found.
+
+The CPU uses Brad Conte's C SHA-1 implementation. The CUDA program adapts its
+SHA-1 operations for device execution; each GPU thread hashes one nonce. The
+common input is hashed once on the host and the resulting SHA-1 state is
+continued independently for each nonce. SHA-1 is used here for an educational
+benchmark only, not for security-sensitive applications.
+
+## Requirements
+
+- Windows, Visual Studio 2022 C/C++ tools, and the NVIDIA CUDA Toolkit
+- A CUDA-capable NVIDIA GPU
+- Run commands from a Visual Studio Developer PowerShell terminal so `cl`,
+  `nvcc`, and the MSVC include paths are available
+
+The CUDA build below targets `sm_86` (compute capability 8.6), used by the
+GeForce RTX 3050 Ti Laptop GPU in the recorded hardware configuration. Change
+the `-arch` value if building for a different GPU.
+
+## CPU SHA-1 known-answer tests
+
+Build and run the original CPU tests:
 
 ```powershell
-cl /nologo /W4 /TC /Focpu\ /Fecpu\sha1_test.exe cpu\sha1.c cpu\sha1_test.c
+cl /nologo /W4 /TC /Focpu\ cpu\sha1.c cpu\sha1_test.c /Fecpu\sha1_test.exe
 if ($LASTEXITCODE -eq 0) { .\cpu\sha1_test.exe }
 ```
 
-## Search with CUDA
+## Build and run the searches
 
-From the project root in VS 2022 Developer PowerShell:
-
-```powershell
-nvcc -arch=sm_86 -O2 -std=c++17 gpu\sha1_search.cu -o gpu\sha1_search.exe
-if ($LASTEXITCODE -eq 0) { .\gpu\sha1_search.exe demo- a 1000000 }
-```
-
-Arguments: `<prefix> <hex-suffix> <attempts> [start-nonce]`. Each candidate is
-the prefix followed by a decimal nonce. This executable searches on the GPU
-only; use the benchmark script for CPU/GPU timing comparisons.
-
-## Benchmark
-
-Builds the CPU and CUDA programs, warms up, then reports median CPU and GPU
-process times plus the GPU kernel time:
+Build the CPU executable with OpenMP enabled:
 
 ```powershell
-.\benchmark.ps1 -Attempts 5000000 -Runs 5
+cl /nologo /W4 /O2 /openmp /TC /Focpu\ /Fecpu\sha1_search.exe cpu\sha1_search.c cpu\sha1.c
 ```
 
-Benchmark hardware:
+CPU usage:
 
-- CPU: 12th Gen Intel Core i7-12700H, 14 cores / 20 logical processors,
-  2.30 GHz base speed.
+```text
+cpu\sha1_search.exe <buffer-hex> <lowercase-hex-suffix> <attempts> [start-nonce] [threads]
+```
+
+For example, find a digest ending in `a` in a search starting at nonce zero:
+
+```powershell
+.\cpu\sha1_search.exe 64656d6f a 1000000 0 1
+.\cpu\sha1_search.exe 64656d6f a 1000000 0 20
+```
+
+The first command runs the sequential case (one thread); the second requests
+20 OpenMP threads. The input `64656d6f` is the bytes for `demo`. An empty input
+buffer can be passed as `""`. The suffix must contain 1–40 lowercase hex
+digits; the buffer must be encoded as even-length lowercase hex.
+
+Build and run the CUDA executable:
+
+```powershell
+nvcc -arch=sm_86 -O2 -std=c++17 -Icpu gpu\sha1_search.cu cpu\sha1.c -o gpu\sha1_search.exe
+.\gpu\sha1_search.exe 64656d6f a 1000000 0
+```
+
+Before searching, the CUDA program runs three known-answer tests on the GPU
+(including binary and multi-block test data). It also verifies any reported
+GPU match with the host C SHA-1 implementation.
+
+## Three-way benchmark
+
+The benchmark builds all implementations, warms them up, runs the same
+candidate range, and checks that all three return the same lowest match. It
+reports medians and ranges for sequential CPU search time, threaded CPU search
+time, and aggregate CUDA kernel time, plus CUDA process time and speedups.
+
+```powershell
+.\benchmark.ps1 -Attempts 1500000000 -Runs 3 -CpuThreads 20
+```
+
+The script defaults to those values. Increase `-Attempts` if the median CUDA
+kernel time does not exceed the assignment's 2-second minimum; the script
+warns when it does not. CUDA work is split into bounded kernel launches so a
+long search does not require one multi-second kernel on Windows. The reported
+CUDA kernel time is the aggregate event time around all chunks.
+
+Timing interpretation:
+
+- CPU search times are measured inside each CPU process and exclude process
+  startup.
+- CUDA kernel time excludes host-side input setup, CUDA initialization, memory
+  allocation/transfers, and result verification.
+- CUDA process time is measured by the benchmark around the whole executable;
+  its difference from kernel time illustrates non-kernel overhead.
+- Speedups compare CPU search medians to the aggregate CUDA kernel median.
+  Process time is reported separately because it includes setup overhead.
+
+The benchmark uses a 128-byte input containing byte values `00` through `7f`,
+suffix `80bfe6c`, and start nonce zero. The suffix is known to match within the
+default range.
+
+### Recorded results
+
+RTX 3050 Ti, 1.5 billion candidates, three runs, plugged in.
+
+| Metric | Median | Range |
+|---|---:|---:|
+| Serial C search | 208.671 s | 208.468–217.760 s |
+| Threaded C search (20 threads) | 23.466 s | 23.314–23.566 s |
+| CUDA kernel | 2.415 s | 2.413–2.415 s |
+| CUDA process | 2.525 s | — |
+| CUDA non-kernel overhead | 0.110 s | — |
+
+| Speedup comparison | Speedup |
+|---|---:|
+| Serial C vs. threaded C | 8.89x |
+| Serial C vs. CUDA kernel | 86.42x |
+| Threaded C vs. CUDA kernel | 9.72x |
+
+The CUDA kernel median exceeds the assignment's 2-second minimum. An earlier
+CUDA-only check of this workload measured 2.616 s; it is not part of the
+three-way comparison above.
+
+## Hardware used for previous measurements
+
+- CPU: 12th Gen Intel Core i7-12700H, 2.30 GHz base speed, 1 socket,
+  14 cores / 20 logical processors
 - GPU: NVIDIA GeForce RTX 3050 Ti Laptop GPU, 2,560 CUDA cores,
-  4.0 GB dedicated and 7.8 GB shared GPU memory.
+  4.0 GB dedicated and 7.8 GB shared GPU memory
 
-RTX 3050 Ti results, five runs; CPU is single-threaded. Process timings include
-startup and CUDA initialization; kernel time excludes startup:
-
-| Candidates | Power condition | CPU process | GPU process | GPU kernel | Kernel speedup | Process speedup |
-|---:|---|---:|---:|---:|---:|---:|
-| 5,000,000 | Plugged in, power mode | 0.762 s | 0.113 s | 8.852 ms | 86.09x | 6.72x |
-| 10,000,000 | Plugged in, power mode | 1.508 s | 0.123 s | 17.687 ms | 85.28x | 12.23x |
-| 100,000,000 | Plugged in, power mode | 15.247 s | 0.299 s | 177.665 ms | 85.82x | 50.96x |
-| 500,000,000 | Plugged in, power mode | 76.152 s | 1.049 s | 900.690 ms | 84.55x | 72.56x |
-| 5,000,000 | Battery, power saving | 1.342 s | 0.995 s | 10.020 ms | 133.89x | 1.35x |
-| 10,000,000 | Battery, power saving | 2.686 s | 1.008 s | 19.740 ms | 136.07x | 2.66x |
-| 100,000,000 | Battery, power saving | 26.925 s | 1.784 s | 210.889 ms | 127.67x | 15.10x |
-| 500,000,000 | Battery, power saving | 135.684 s | 2.653 s | 1,063.628 ms | 127.57x | 51.15x |
-
-Candidates are limited to 55 bytes; suffixes must be 1–40 hexadecimal
-characters.
+Older benchmark numbers in this repository were produced by a different
+candidate format and workload, so they are not directly comparable to this
+`B || LE64(n)` three-way benchmark.
 
 ## Source
 
-CPU implementation and test: [Brad Conte's crypto-algorithms repository](https://github.com/B-Con/crypto-algorithms), [SHA-1 test source](https://github.com/B-Con/crypto-algorithms/blob/master/sha1_test.c).
+- Brad Conte, [crypto-algorithms](https://github.com/B-Con/crypto-algorithms)
+- Original [SHA-1 test source](https://github.com/B-Con/crypto-algorithms/blob/master/sha1_test.c)

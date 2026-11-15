@@ -1,6 +1,5 @@
 #include <cuda_runtime.h>
 
-#include <chrono>
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
@@ -8,197 +7,209 @@
 #include <cstring>
 #include <limits>
 #include <string>
+#include <vector>
+
+extern "C" {
+#include "sha1.h"
+}
 
 namespace {
 
-// Search launch configuration and the SHA-1 single-block input limits.
-constexpr int kThreadsPerBlock = 256;
-constexpr int kMaxMessageLength = 55;
-constexpr int kDigestSize = 20;
+constexpr unsigned int kThreadsPerBlock = 256;
+constexpr unsigned long long kMaxCandidatesPerLaunch = 1ULL << 24;
+constexpr int kDigestSize = SHA1_BLOCK_SIZE;
 
-// Rotate a 32-bit word left; SHA-1 uses this operation throughout its rounds.
-__device__ __forceinline__ uint32_t rotate_left(uint32_t value, unsigned int bits)
+__device__ __forceinline__ WORD rotate_left(WORD value, unsigned int bits)
 {
 	return (value << bits) | (value >> (32 - bits));
 }
 
-// Hash one message of at most 55 bytes, including SHA-1 padding, in one block.
-__device__ void sha1_one_block(const unsigned char* message, unsigned int length,
-                               unsigned char digest[kDigestSize])
+// Device adaptation of the SHA-1 compression routine from cpu/sha1.c.
+__device__ void sha1_device_transform(SHA1_CTX* ctx, const BYTE data[])
 {
-	uint32_t words[16];
-	// Convert the 64-byte padded message block into SHA-1's big-endian words.
-	for (int i = 0; i < 16; ++i) {
-		const int offset = i * 4;
-		words[i] = (static_cast<uint32_t>(message[offset]) << 24) |
-		           (static_cast<uint32_t>(message[offset + 1]) << 16) |
-		           (static_cast<uint32_t>(message[offset + 2]) << 8) |
-		           static_cast<uint32_t>(message[offset + 3]);
+	WORD a, b, c, d, e, i, j, t, words[80];
+
+	for (i = 0, j = 0; i < 16; ++i, j += 4) {
+		words[i] = ((WORD)data[j] << 24) | ((WORD)data[j + 1] << 16) |
+		           ((WORD)data[j + 2] << 8) | (WORD)data[j + 3];
+	}
+	for (; i < 80; ++i) {
+		words[i] = words[i - 3] ^ words[i - 8] ^ words[i - 14] ^ words[i - 16];
+		words[i] = rotate_left(words[i], 1);
 	}
 
-	// Add the mandatory padding bit and encode the message length in bits.
-	const unsigned int padding_word = length / 4;
-	const unsigned int padding_shift = 24 - (length % 4) * 8;
-	words[padding_word] |= 0x80u << padding_shift;
-	words[14] = 0;
-	words[15] = length * 8;
+	a = ctx->state[0];
+	b = ctx->state[1];
+	c = ctx->state[2];
+	d = ctx->state[3];
+	e = ctx->state[4];
 
-	// Initialize SHA-1's five working words to the standard initial state.
-	uint32_t a = 0x67452301u;
-	uint32_t b = 0xefcdab89u;
-	uint32_t c = 0x98badcfeu;
-	uint32_t d = 0x10325476u;
-	uint32_t e = 0xc3d2e1f0u;
-
-	// Expand the message schedule as needed and perform all 80 SHA-1 rounds.
-	for (unsigned int round = 0; round < 80; ++round) {
-		uint32_t word;
-		if (round < 16) {
-			word = words[round];
-		}
-		else {
-			const unsigned int slot = round & 15;
-			words[slot] = rotate_left(
-				words[(round - 3) & 15] ^ words[(round - 8) & 15] ^
-				words[(round - 14) & 15] ^ words[slot], 1);
-			word = words[slot];
-		}
-
-		uint32_t function;
-		uint32_t constant;
-		if (round < 20) {
-			function = (b & c) | (~b & d);
-			constant = 0x5a827999u;
-		}
-		else if (round < 40) {
-			function = b ^ c ^ d;
-			constant = 0x6ed9eba1u;
-		}
-		else if (round < 60) {
-			function = (b & c) | (b & d) | (c & d);
-			constant = 0x8f1bbcdcu;
-		}
-		else {
-			function = b ^ c ^ d;
-			constant = 0xca62c1d6u;
-		}
-
-		const uint32_t next = rotate_left(a, 5) + function + e + constant + word;
+	for (i = 0; i < 20; ++i) {
+		t = rotate_left(a, 5) + ((b & c) | (~b & d)) + e + ctx->k[0] + words[i];
 		e = d;
 		d = c;
 		c = rotate_left(b, 30);
 		b = a;
-		a = next;
+		a = t;
+	}
+	for (; i < 40; ++i) {
+		t = rotate_left(a, 5) + (b ^ c ^ d) + e + ctx->k[1] + words[i];
+		e = d;
+		d = c;
+		c = rotate_left(b, 30);
+		b = a;
+		a = t;
+	}
+	for (; i < 60; ++i) {
+		t = rotate_left(a, 5) + ((b & c) | (b & d) | (c & d)) +
+		    e + ctx->k[2] + words[i];
+		e = d;
+		d = c;
+		c = rotate_left(b, 30);
+		b = a;
+		a = t;
+	}
+	for (; i < 80; ++i) {
+		t = rotate_left(a, 5) + (b ^ c ^ d) + e + ctx->k[3] + words[i];
+		e = d;
+		d = c;
+		c = rotate_left(b, 30);
+		b = a;
+		a = t;
 	}
 
-	// Add the working values back to the initial state and serialize the digest.
-	const uint32_t state[5] = {
-		0x67452301u + a,
-		0xefcdab89u + b,
-		0x98badcfeu + c,
-		0x10325476u + d,
-		0xc3d2e1f0u + e
-	};
-	for (int i = 0; i < 5; ++i) {
-		digest[i * 4] = static_cast<unsigned char>(state[i] >> 24);
-		digest[i * 4 + 1] = static_cast<unsigned char>(state[i] >> 16);
-		digest[i * 4 + 2] = static_cast<unsigned char>(state[i] >> 8);
-		digest[i * 4 + 3] = static_cast<unsigned char>(state[i]);
+	ctx->state[0] += a;
+	ctx->state[1] += b;
+	ctx->state[2] += c;
+	ctx->state[3] += d;
+	ctx->state[4] += e;
+}
+
+__device__ void sha1_device_init(SHA1_CTX* ctx)
+{
+	ctx->datalen = 0;
+	ctx->bitlen = 0;
+	ctx->state[0] = 0x67452301u;
+	ctx->state[1] = 0xefcdab89u;
+	ctx->state[2] = 0x98badcfeu;
+	ctx->state[3] = 0x10325476u;
+	ctx->state[4] = 0xc3d2e1f0u;
+	ctx->k[0] = 0x5a827999u;
+	ctx->k[1] = 0x6ed9eba1u;
+	ctx->k[2] = 0x8f1bbcdcu;
+	ctx->k[3] = 0xca62c1d6u;
+}
+
+__device__ void sha1_device_update(SHA1_CTX* ctx, const BYTE data[], size_t length)
+{
+	for (size_t i = 0; i < length; ++i) {
+		ctx->data[ctx->datalen++] = data[i];
+		if (ctx->datalen == 64) {
+			sha1_device_transform(ctx, ctx->data);
+			ctx->bitlen += 512;
+			ctx->datalen = 0;
+		}
 	}
 }
 
-// Convert a normalized lowercase hexadecimal digit to its numeric value.
-__device__ __forceinline__ int hex_value(char value)
+__device__ void sha1_device_final(SHA1_CTX* ctx, BYTE digest[])
 {
-	if (value >= '0' && value <= '9')
-		return value - '0';
-	return value - 'a' + 10;
+	WORD i = ctx->datalen;
+	if (ctx->datalen < 56) {
+		ctx->data[i++] = 0x80;
+		while (i < 56)
+			ctx->data[i++] = 0;
+	}
+	else {
+		ctx->data[i++] = 0x80;
+		while (i < 64)
+			ctx->data[i++] = 0;
+		sha1_device_transform(ctx, ctx->data);
+		for (i = 0; i < 56; ++i)
+			ctx->data[i] = 0;
+	}
+
+	ctx->bitlen += ctx->datalen * 8;
+	ctx->data[63] = (BYTE)ctx->bitlen;
+	ctx->data[62] = (BYTE)(ctx->bitlen >> 8);
+	ctx->data[61] = (BYTE)(ctx->bitlen >> 16);
+	ctx->data[60] = (BYTE)(ctx->bitlen >> 24);
+	ctx->data[59] = (BYTE)(ctx->bitlen >> 32);
+	ctx->data[58] = (BYTE)(ctx->bitlen >> 40);
+	ctx->data[57] = (BYTE)(ctx->bitlen >> 48);
+	ctx->data[56] = (BYTE)(ctx->bitlen >> 56);
+	sha1_device_transform(ctx, ctx->data);
+
+	for (i = 0; i < 4; ++i) {
+		digest[i] = (BYTE)(ctx->state[0] >> (24 - i * 8));
+		digest[i + 4] = (BYTE)(ctx->state[1] >> (24 - i * 8));
+		digest[i + 8] = (BYTE)(ctx->state[2] >> (24 - i * 8));
+		digest[i + 12] = (BYTE)(ctx->state[3] >> (24 - i * 8));
+		digest[i + 16] = (BYTE)(ctx->state[4] >> (24 - i * 8));
+	}
 }
 
-// Compare the requested hexadecimal suffix against the digest's final nibbles.
-__device__ bool matches_suffix(const unsigned char digest[kDigestSize],
-                               const char* suffix, int suffix_length)
+__device__ bool device_matches_suffix(const BYTE digest[kDigestSize],
+                                      const char* suffix, int length)
 {
-	const int first_nibble = 40 - suffix_length;
-	for (int i = 0; i < suffix_length; ++i) {
-		const int digest_nibble = first_nibble + i;
-		const unsigned char byte = digest[digest_nibble / 2];
-		const int actual = (digest_nibble & 1) ? (byte & 0x0f) : (byte >> 4);
-		if (actual != hex_value(suffix[i]))
+	const int first_nibble = 40 - length;
+	for (int i = 0; i < length; ++i) {
+		const int nibble = first_nibble + i;
+		const BYTE byte = digest[nibble / 2];
+		const int value = (nibble & 1) ? (byte & 0x0f) : (byte >> 4);
+		const int target = suffix[i] <= '9'
+			? suffix[i] - '0'
+			: suffix[i] - 'a' + 10;
+		if (value != target)
 			return false;
 	}
 	return true;
 }
 
-// Write an unsigned nonce as decimal digits and return the digit count.
-__device__ unsigned int append_decimal(unsigned long long value,
-                                       unsigned char* output)
+__global__ void known_answer_kernel(BYTE* output)
 {
-	unsigned char reversed[20];
-	unsigned int count = 0;
-	do {
-		reversed[count++] = static_cast<unsigned char>('0' + value % 10);
-		value /= 10;
-	} while (value != 0);
+	if (blockIdx.x != 0 || threadIdx.x != 0)
+		return;
 
-	for (unsigned int i = 0; i < count; ++i)
-		output[i] = reversed[count - i - 1];
-	return count;
+	const BYTE abc[] = {'a', 'b', 'c'};
+	const BYTE binary[] = {0x80, 0xff, 0x00};
+	const BYTE long_message[] =
+		"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
+	const BYTE* inputs[] = {abc, binary, long_message};
+	const size_t lengths[] = {sizeof(abc), sizeof(binary), sizeof(long_message) - 1};
+	for (int test = 0; test < 3; ++test) {
+		SHA1_CTX context;
+		sha1_device_init(&context);
+		sha1_device_update(&context, inputs[test], lengths[test]);
+		sha1_device_final(&context, output + test * kDigestSize);
+	}
 }
 
-// Run a couple of fixed SHA-1 vectors on the GPU for startup correctness checks.
-__global__ void hash_vectors_kernel(unsigned char* output)
-{
-	unsigned char message[64] = {};
-	unsigned char digest[kDigestSize];
-	message[0] = 'a';
-	message[1] = 'b';
-	message[2] = 'c';
-	sha1_one_block(message, 3, digest);
-	for (int i = 0; i < kDigestSize; ++i)
-		output[i] = digest[i];
-
-	message[0] = 0x80;
-	message[1] = 0xff;
-	message[2] = 0x00;
-	sha1_one_block(message, 3, digest);
-	for (int i = 0; i < kDigestSize; ++i)
-		output[kDigestSize + i] = digest[i];
-}
-
-// Hash one distinct prefix-plus-nonce candidate per CUDA thread.
-__global__ void search_kernel(const unsigned char* prefix, int prefix_length,
-                              const char* suffix, int suffix_length,
-                              unsigned long long start_nonce,
+__global__ void search_kernel(const SHA1_CTX* base_context, const char* suffix,
+                              int suffix_length, unsigned long long start_nonce,
                               unsigned long long attempts,
-                              unsigned long long* found_nonce,
-                              int* found_flag)
+                              unsigned long long* found_nonce, int* found_flag)
 {
-	// Map this thread to its candidate index in the requested nonce range.
 	const unsigned long long index =
 		static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
 	if (index >= attempts)
 		return;
 
-	unsigned char message[64] = {};
-	for (int i = 0; i < prefix_length; ++i)
-		message[i] = prefix[i];
-	// Append this thread's decimal nonce and hash the resulting candidate.
-	const unsigned int nonce_length =
-		append_decimal(start_nonce + index, message + prefix_length);
-	const unsigned int message_length =
-		static_cast<unsigned int>(prefix_length) + nonce_length;
+	const unsigned long long nonce = start_nonce + index;
+	BYTE nonce_bytes[8];
+	for (int i = 0; i < 8; ++i)
+		nonce_bytes[i] = (BYTE)(nonce >> (i * 8));
 
-	unsigned char digest[kDigestSize];
-	sha1_one_block(message, message_length, digest);
-	if (matches_suffix(digest, suffix, suffix_length)) {
-		// If several candidates match, preserve the lowest nonce found.
-		atomicMin(found_nonce, start_nonce + index);
+	SHA1_CTX context = *base_context;
+	BYTE digest[kDigestSize];
+	sha1_device_update(&context, nonce_bytes, sizeof(nonce_bytes));
+	sha1_device_final(&context, digest);
+	if (device_matches_suffix(digest, suffix, suffix_length)) {
+		atomicMin(found_nonce, nonce);
 		atomicExch(found_flag, 1);
 	}
 }
 
-// Stop on CUDA API failures and print the operation that failed.
 void check_cuda(cudaError_t result, const char* operation)
 {
 	if (result != cudaSuccess) {
@@ -208,19 +219,31 @@ void check_cuda(cudaError_t result, const char* operation)
 	}
 }
 
-// Parse one hexadecimal character; return -1 for invalid characters.
-int parse_hex(char value)
+int hex_value(char value)
 {
 	if (value >= '0' && value <= '9')
 		return value - '0';
 	if (value >= 'a' && value <= 'f')
 		return value - 'a' + 10;
-	if (value >= 'A' && value <= 'F')
-		return value - 'A' + 10;
 	return -1;
 }
 
-// Parse a non-negative decimal integer and reject malformed or overflowing input.
+bool parse_hex_buffer(const char* text, std::vector<BYTE>* buffer)
+{
+	const size_t length = std::strlen(text);
+	if (length % 2 != 0)
+		return false;
+	buffer->resize(length / 2);
+	for (size_t i = 0; i < buffer->size(); ++i) {
+		const int high = hex_value(text[i * 2]);
+		const int low = hex_value(text[i * 2 + 1]);
+		if (high < 0 || low < 0)
+			return false;
+		(*buffer)[i] = static_cast<BYTE>((high << 4) | low);
+	}
+	return true;
+}
+
 bool parse_unsigned(const char* text, unsigned long long* value)
 {
 	if (text[0] == '\0' || text[0] == '-')
@@ -234,34 +257,50 @@ bool parse_unsigned(const char* text, unsigned long long* value)
 	return true;
 }
 
-// Print the command-line syntax and the candidate-length constraint.
-void print_usage(const char* program)
+bool host_matches_suffix(const BYTE digest[kDigestSize], const std::string& suffix)
 {
-	std::fprintf(stderr,
-	             "Usage: %s <prefix> <hex-suffix> <attempts> [start-nonce]\n"
-	             "Searches SHA-1(prefix + decimal nonce) for the suffix.\n"
-	             "The complete candidate must be at most 55 bytes.\n"
-	             "Example: %s demo- a 1000000\n",
-	             program, program);
+	const int first_nibble = 40 - static_cast<int>(suffix.size());
+	for (int i = 0; i < static_cast<int>(suffix.size()); ++i) {
+		const int nibble = first_nibble + i;
+		const BYTE byte = digest[nibble / 2];
+		const int value = (nibble & 1) ? (byte & 0x0f) : (byte >> 4);
+		const int target = hex_value(suffix[static_cast<size_t>(i)]);
+		if (value != target)
+			return false;
+	}
+	return true;
 }
 
-// Launch GPU known-answer tests and compare their output with trusted digests.
+void encode_nonce(unsigned long long nonce, BYTE bytes[8])
+{
+	for (int i = 0; i < 8; ++i)
+		bytes[i] = static_cast<BYTE>(nonce >> (i * 8));
+}
+
+void print_digest(const BYTE digest[kDigestSize])
+{
+	for (int i = 0; i < kDigestSize; ++i)
+		std::printf("%02x", digest[i]);
+}
+
 int validate_gpu_vectors()
 {
-	const unsigned char expected[kDigestSize * 2] = {
+	const BYTE expected[kDigestSize * 3] = {
 		0xa9,0x99,0x3e,0x36,0x47,0x06,0x81,0x6a,0xba,0x3e,
 		0x25,0x71,0x78,0x50,0xc2,0x6c,0x9c,0xd0,0xd8,0x9d,
 		0x51,0x92,0x47,0x6d,0xfc,0x3e,0xe7,0x79,0x03,0x07,
-		0x31,0x88,0x23,0xe5,0x48,0x0b,0xcf,0x9b,0x40,0xcd
+		0x31,0x88,0x23,0xe5,0x48,0x0b,0xcf,0x9b,0x40,0xcd,
+		0x84,0x98,0x3e,0x44,0x1c,0x3b,0xd2,0x6e,0xba,0xae,
+		0x4a,0xa1,0xf9,0x51,0x29,0xe5,0xe5,0x46,0x70,0xf1
 	};
-	unsigned char* device_output = nullptr;
-	unsigned char actual[kDigestSize * 2];
-	check_cuda(cudaMalloc(&device_output, sizeof(actual)), "allocating test vectors");
-	hash_vectors_kernel<<<1, 1>>>(device_output);
-	check_cuda(cudaGetLastError(), "launching SHA-1 self-test");
+	BYTE* device_output = nullptr;
+	BYTE actual[kDigestSize * 3];
+	check_cuda(cudaMalloc(&device_output, sizeof(actual)), "allocating test digests");
+	known_answer_kernel<<<1, 1>>>(device_output);
+	check_cuda(cudaGetLastError(), "launching SHA-1 known-answer tests");
 	check_cuda(cudaMemcpy(actual, device_output, sizeof(actual),
-	                      cudaMemcpyDeviceToHost), "copying test vectors");
-	check_cuda(cudaFree(device_output), "freeing test-vector memory");
+	                      cudaMemcpyDeviceToHost), "copying test digests");
+	check_cuda(cudaFree(device_output), "freeing test digests");
 	if (std::memcmp(actual, expected, sizeof(expected)) != 0) {
 		std::fprintf(stderr, "CUDA SHA-1 known-answer tests failed.\n");
 		return 1;
@@ -274,46 +313,50 @@ int validate_gpu_vectors()
 
 int main(int argc, char** argv)
 {
-	// Read and validate the prefix, hexadecimal suffix, attempt count, and nonce range.
 	if (argc < 4 || argc > 5) {
-		print_usage(argv[0]);
+		std::fprintf(stderr,
+		             "Usage: %s <buffer-hex> <lowercase-hex-suffix> <attempts> "
+		             "[start-nonce]\n",
+		             argv[0]);
 		return EXIT_FAILURE;
 	}
 
-	const std::string prefix(argv[1]);
-	std::string suffix(argv[2]);
-	unsigned long long attempts = 0;
-	unsigned long long start_nonce = 0;
-	if (prefix.size() > kMaxMessageLength - 20) {
-		std::fprintf(stderr, "Error: prefix must be at most 35 bytes.\n");
+	std::vector<BYTE> buffer;
+	if (!parse_hex_buffer(argv[1], &buffer)) {
+		std::fprintf(stderr, "Error: input buffer must be valid even-length lowercase hex.\n");
 		return EXIT_FAILURE;
 	}
+	const std::string suffix(argv[2]);
 	if (suffix.empty() || suffix.size() > 40) {
-		std::fprintf(stderr, "Error: suffix must contain 1 to 40 hex characters.\n");
+		std::fprintf(stderr, "Error: suffix must contain 1 to 40 lowercase hex digits.\n");
 		return EXIT_FAILURE;
 	}
-	for (char& value : suffix) {
-		if (parse_hex(value) < 0) {
-			std::fprintf(stderr, "Error: suffix must contain only hexadecimal characters.\n");
+	for (char value : suffix) {
+		if (hex_value(value) < 0) {
+			std::fprintf(stderr, "Error: suffix must use lowercase hexadecimal characters.\n");
 			return EXIT_FAILURE;
 		}
-		if (value >= 'A' && value <= 'F')
-			value = static_cast<char>(value - 'A' + 'a');
 	}
+
+	unsigned long long attempts = 0;
+	unsigned long long start_nonce = 0;
 	if (!parse_unsigned(argv[3], &attempts) || attempts == 0) {
 		std::fprintf(stderr, "Error: attempts must be a positive integer.\n");
 		return EXIT_FAILURE;
 	}
 	if (argc == 5 && !parse_unsigned(argv[4], &start_nonce)) {
-		std::fprintf(stderr, "Error: start-nonce must be an unsigned integer.\n");
+		std::fprintf(stderr, "Error: start nonce must be an unsigned integer.\n");
 		return EXIT_FAILURE;
 	}
 	if (attempts - 1 > std::numeric_limits<unsigned long long>::max() - start_nonce) {
 		std::fprintf(stderr, "Error: nonce range overflows 64-bit unsigned integers.\n");
 		return EXIT_FAILURE;
 	}
+	if (buffer.size() > std::numeric_limits<unsigned long long>::max() / 8 - 8) {
+		std::fprintf(stderr, "Error: input buffer is too long for SHA-1 length encoding.\n");
+		return EXIT_FAILURE;
+	}
 
-	// Confirm that a CUDA device is available and the requested launch fits its grid.
 	int device_count = 0;
 	check_cuda(cudaGetDeviceCount(&device_count), "querying CUDA devices");
 	if (device_count == 0) {
@@ -323,85 +366,96 @@ int main(int argc, char** argv)
 	cudaDeviceProp device_properties;
 	check_cuda(cudaGetDeviceProperties(&device_properties, 0),
 	           "querying GPU properties");
-	const unsigned long long max_grid_attempts =
-		static_cast<unsigned long long>(device_properties.maxGridSize[0]) *
-		kThreadsPerBlock;
-	if (attempts > max_grid_attempts) {
-		std::fprintf(stderr, "Error: attempts exceed the single-launch GPU limit (%llu).\n",
-		             max_grid_attempts);
-		return EXIT_FAILURE;
-	}
-
 	if (validate_gpu_vectors() != 0)
 		return EXIT_FAILURE;
 
-	// Allocate GPU buffers and copy the shared prefix and suffix to device memory.
-	unsigned char* device_prefix = nullptr;
+	// Pre-hash the common input once, then clone its SHA-1 state per nonce.
+	SHA1_CTX base_context;
+	sha1_init(&base_context);
+	sha1_update(&base_context, buffer.empty() ? nullptr : buffer.data(), buffer.size());
+
+	SHA1_CTX* device_base_context = nullptr;
 	char* device_suffix = nullptr;
-	unsigned long long* device_found = nullptr;
+	unsigned long long* device_found_nonce = nullptr;
 	int* device_found_flag = nullptr;
-	check_cuda(cudaMalloc(&device_prefix, prefix.empty() ? 1 : prefix.size()),
-	           "allocating prefix");
+	check_cuda(cudaMalloc(&device_base_context, sizeof(base_context)),
+	           "allocating base SHA-1 state");
 	check_cuda(cudaMalloc(&device_suffix, suffix.size()), "allocating suffix");
-	check_cuda(cudaMalloc(&device_found, sizeof(*device_found)),
-	           "allocating result");
+	check_cuda(cudaMalloc(&device_found_nonce, sizeof(*device_found_nonce)),
+	           "allocating result nonce");
 	check_cuda(cudaMalloc(&device_found_flag, sizeof(*device_found_flag)),
 	           "allocating result flag");
-	if (!prefix.empty()) {
-		check_cuda(cudaMemcpy(device_prefix, prefix.data(), prefix.size(),
-		                      cudaMemcpyHostToDevice), "copying prefix");
-	}
+	check_cuda(cudaMemcpy(device_base_context, &base_context, sizeof(base_context),
+	                      cudaMemcpyHostToDevice), "copying base SHA-1 state");
 	check_cuda(cudaMemcpy(device_suffix, suffix.data(), suffix.size(),
 	                      cudaMemcpyHostToDevice), "copying suffix");
-	const unsigned long long no_result = std::numeric_limits<unsigned long long>::max();
+	const unsigned long long no_result =
+		std::numeric_limits<unsigned long long>::max();
 	const int no_match = 0;
-	check_cuda(cudaMemcpy(device_found, &no_result, sizeof(no_result),
-	                      cudaMemcpyHostToDevice), "initializing result");
+	check_cuda(cudaMemcpy(device_found_nonce, &no_result, sizeof(no_result),
+	                      cudaMemcpyHostToDevice), "initializing result nonce");
 	check_cuda(cudaMemcpy(device_found_flag, &no_match, sizeof(no_match),
 	                      cudaMemcpyHostToDevice), "initializing result flag");
 
-	// Launch enough threads to cover the candidate range and time only the kernel.
-	const unsigned int blocks = static_cast<unsigned int>(
-		(attempts - 1) / kThreadsPerBlock + 1);
-	cudaEvent_t kernel_start;
-	cudaEvent_t kernel_stop;
-	check_cuda(cudaEventCreate(&kernel_start), "creating kernel start event");
-	check_cuda(cudaEventCreate(&kernel_stop), "creating kernel stop event");
-	check_cuda(cudaEventRecord(kernel_start), "starting kernel timer");
-	search_kernel<<<blocks, kThreadsPerBlock>>>(
-		device_prefix, static_cast<int>(prefix.size()), device_suffix,
-		static_cast<int>(suffix.size()), start_nonce, attempts, device_found,
-		device_found_flag);
-	check_cuda(cudaGetLastError(), "launching search kernel");
-	check_cuda(cudaEventRecord(kernel_stop), "stopping kernel timer");
-	check_cuda(cudaEventSynchronize(kernel_stop), "waiting for search kernel");
+	cudaEvent_t start_event;
+	cudaEvent_t stop_event;
+	check_cuda(cudaEventCreate(&start_event), "creating kernel start event");
+	check_cuda(cudaEventCreate(&stop_event), "creating kernel stop event");
+	check_cuda(cudaEventRecord(start_event), "starting kernel timer");
+	unsigned long long processed = 0;
+	while (processed < attempts) {
+		const unsigned long long chunk_count =
+			(attempts - processed < kMaxCandidatesPerLaunch)
+				? attempts - processed
+				: kMaxCandidatesPerLaunch;
+		const unsigned int blocks = static_cast<unsigned int>(
+			(chunk_count - 1) / kThreadsPerBlock + 1);
+		search_kernel<<<blocks, kThreadsPerBlock>>>(
+			device_base_context, device_suffix, static_cast<int>(suffix.size()),
+			start_nonce + processed, chunk_count, device_found_nonce,
+			device_found_flag);
+		check_cuda(cudaGetLastError(), "launching search kernel chunk");
+		processed += chunk_count;
+	}
+	check_cuda(cudaEventRecord(stop_event), "stopping kernel timer");
+	check_cuda(cudaEventSynchronize(stop_event), "waiting for search kernel");
 	float kernel_milliseconds = 0.0f;
-	check_cuda(cudaEventElapsedTime(&kernel_milliseconds, kernel_start, kernel_stop),
+	check_cuda(cudaEventElapsedTime(&kernel_milliseconds, start_event, stop_event),
 	           "measuring search kernel");
 
-	// Copy the match status back, then release the GPU buffers and timing events.
-	unsigned long long gpu_found = no_result;
-	int gpu_has_match = 0;
-	check_cuda(cudaMemcpy(&gpu_found, device_found, sizeof(gpu_found),
-	                      cudaMemcpyDeviceToHost), "copying search result");
-	check_cuda(cudaMemcpy(&gpu_has_match, device_found_flag, sizeof(gpu_has_match),
+	unsigned long long found_nonce = no_result;
+	int found = 0;
+	check_cuda(cudaMemcpy(&found_nonce, device_found_nonce, sizeof(found_nonce),
+	                      cudaMemcpyDeviceToHost), "copying result nonce");
+	check_cuda(cudaMemcpy(&found, device_found_flag, sizeof(found),
 	                      cudaMemcpyDeviceToHost), "copying result flag");
-	check_cuda(cudaEventDestroy(kernel_start), "destroying kernel start event");
-	check_cuda(cudaEventDestroy(kernel_stop), "destroying kernel stop event");
-	check_cuda(cudaFree(device_prefix), "freeing prefix");
+	check_cuda(cudaEventDestroy(start_event), "destroying kernel start event");
+	check_cuda(cudaEventDestroy(stop_event), "destroying kernel stop event");
+	check_cuda(cudaFree(device_base_context), "freeing base SHA-1 state");
 	check_cuda(cudaFree(device_suffix), "freeing suffix");
-	check_cuda(cudaFree(device_found), "freeing result");
+	check_cuda(cudaFree(device_found_nonce), "freeing result nonce");
 	check_cuda(cudaFree(device_found_flag), "freeing result flag");
 
-	// Print the first matching nonce (if any) and the measured kernel duration.
 	std::printf("GPU: %s\n", device_properties.name);
-	if (!gpu_has_match) {
-		std::printf("GPU: no match in %llu candidates\n", attempts);
+	std::printf("Candidates: %llu\n", attempts);
+	if (found) {
+		BYTE nonce_bytes[8];
+		BYTE digest[kDigestSize];
+		SHA1_CTX verify_context = base_context;
+		encode_nonce(found_nonce, nonce_bytes);
+		sha1_update(&verify_context, nonce_bytes, sizeof(nonce_bytes));
+		sha1_final(&verify_context, digest);
+		if (!host_matches_suffix(digest, suffix)) {
+			std::fprintf(stderr, "Error: CPU verification of the GPU result failed.\n");
+			return EXIT_FAILURE;
+		}
+		std::printf("GPU match: nonce=%llu digest=", found_nonce);
+		print_digest(digest);
+		std::putchar('\n');
 	}
 	else {
-		std::printf("GPU match: %s%llu\n", prefix.c_str(), gpu_found);
+		std::printf("GPU: no match in %llu candidates\n", attempts);
 	}
 	std::printf("GPU kernel: %.3f ms\n", kernel_milliseconds);
-
 	return EXIT_SUCCESS;
 }
