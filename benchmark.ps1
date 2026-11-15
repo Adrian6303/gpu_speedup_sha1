@@ -7,8 +7,10 @@ param(
 
 $ErrorActionPreference = "Stop"
 $root = $PSScriptRoot
-$cpuExecutable = Join-Path $root "cpu\sha1_search.exe"
-$gpuExecutable = Join-Path $root "gpu\sha1_search.exe"
+$cpuBuildDirectory = Join-Path $root "cpu\build"
+$gpuBuildDirectory = Join-Path $root "gpu\build"
+$cpuExecutable = Join-Path $cpuBuildDirectory "sha1_search.exe"
+$gpuExecutable = Join-Path $gpuBuildDirectory "sha1_search.exe"
 $bufferHex = -join (0..127 | ForEach-Object { $_.ToString("x2") })
 $suffix = "80bfe6c"
 $startNonce = [UInt64]0
@@ -19,8 +21,34 @@ if ($Attempts -lt 1 -or $CpuThreads -lt 1) {
 if ($Attempts -gt ([UInt64]::MaxValue - $startNonce)) {
 	throw "Attempt range overflows the unsigned 64-bit nonce range."
 }
+if ([string]::IsNullOrWhiteSpace($env:INCLUDE) -or
+	[string]::IsNullOrWhiteSpace($env:LIB)) {
+	$vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+	if (-not (Test-Path $vswhere)) {
+		throw "The MSVC compiler environment is not initialized, and Visual Studio Installer (vswhere.exe) was not found. Open a VS 2022 Developer PowerShell terminal, then rerun the benchmark."
+	}
+
+	$installationPath = (& $vswhere -latest -products "*" `
+		-requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+		-property installationPath | Select-Object -First 1)
+	if ([string]::IsNullOrWhiteSpace($installationPath)) {
+		throw "No Visual Studio installation with the C++ build tools was found."
+	}
+
+	$developerShell = Join-Path $installationPath "Common7\Tools\Launch-VsDevShell.ps1"
+	if (-not (Test-Path $developerShell)) {
+		throw "Visual Studio's Developer PowerShell script was not found at '$developerShell'."
+	}
+
+	Write-Host "Initializing the Visual Studio C++ build environment..."
+	& $developerShell -Arch amd64
+	if ([string]::IsNullOrWhiteSpace($env:INCLUDE) -or
+		[string]::IsNullOrWhiteSpace($env:LIB)) {
+		throw "Visual Studio did not initialize the MSVC INCLUDE/LIB environment."
+	}
+}
 if (-not (Get-Command cl -ErrorAction SilentlyContinue)) {
-	throw "cl was not found. Open a VS 2022 Developer PowerShell terminal."
+	throw "cl was not found after initializing Visual Studio. Install the VS 2022 C++ build tools."
 }
 if (-not (Get-Command nvcc -ErrorAction SilentlyContinue)) {
 	throw "nvcc was not found. Install the NVIDIA CUDA Toolkit."
@@ -28,11 +56,12 @@ if (-not (Get-Command nvcc -ErrorAction SilentlyContinue)) {
 
 Push-Location $root
 try {
-	& cl /nologo /O2 /openmp /TC /Focpu\ /Fecpu\sha1_search.exe cpu\sha1_search.c cpu\sha1.c
+	New-Item -ItemType Directory -Force -Path $cpuBuildDirectory, $gpuBuildDirectory | Out-Null
+	& cl /nologo /O2 /openmp /TC "/Fo$cpuBuildDirectory\" "/Fe$cpuExecutable" cpu\sha1_search.c cpu\sha1.c
 	if ($LASTEXITCODE -ne 0) {
 		throw "CPU search build failed."
 	}
-	& nvcc -arch=sm_86 -O2 -std=c++17 -Icpu gpu\sha1_search.cu cpu\sha1.c -o gpu\sha1_search.exe
+	& nvcc -arch=sm_86 -O2 -std=c++17 -Icpu gpu\sha1_search.cu cpu\sha1.c -o $gpuExecutable
 	if ($LASTEXITCODE -ne 0) {
 		throw "CUDA search build failed."
 	}

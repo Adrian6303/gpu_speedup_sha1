@@ -19,12 +19,23 @@ common input is hashed once on the host and the resulting SHA-1 state is
 continued independently for each nonce. SHA-1 is used here for an educational
 benchmark only, not for security-sensitive applications.
 
+## Project layout
+
+- `cpu\`: shared SHA-1 C implementation, CPU search, and CPU test sources
+- `gpu\`: CUDA search source
+- `cpu\build\` and `gpu\build\`: generated executables and compiler outputs
+- `benchmark.ps1`: builds and benchmarks all three search modes
+
+Build output folders are ignored by Git and are created automatically by the
+benchmark script or the build commands below.
+
 ## Requirements
 
 - Windows, Visual Studio 2022 C/C++ tools, and the NVIDIA CUDA Toolkit
 - A CUDA-capable NVIDIA GPU
-- Run commands from a Visual Studio Developer PowerShell terminal so `cl`,
-  `nvcc`, and the MSVC include paths are available
+- Manual build commands require a Visual Studio Developer PowerShell terminal.
+  The benchmark script attempts to initialize MSVC automatically when it finds
+  Visual Studio and its C++ build tools; otherwise, use Developer PowerShell.
 
 The CUDA build below targets `sm_86` (compute capability 8.6), used by the
 GeForce RTX 3050 Ti Laptop GPU in the recorded hardware configuration. Change
@@ -35,8 +46,9 @@ the `-arch` value if building for a different GPU.
 Build and run the original CPU tests:
 
 ```powershell
-cl /nologo /W4 /TC /Focpu\ cpu\sha1.c cpu\sha1_test.c /Fecpu\sha1_test.exe
-if ($LASTEXITCODE -eq 0) { .\cpu\sha1_test.exe }
+New-Item -ItemType Directory -Force cpu\build | Out-Null
+cl /nologo /W4 /TC /Focpu\build\ cpu\sha1.c cpu\sha1_test.c /Fecpu\build\sha1_test.exe
+if ($LASTEXITCODE -eq 0) { .\cpu\build\sha1_test.exe }
 ```
 
 ## Build and run the searches
@@ -44,20 +56,21 @@ if ($LASTEXITCODE -eq 0) { .\cpu\sha1_test.exe }
 Build the CPU executable with OpenMP enabled:
 
 ```powershell
-cl /nologo /W4 /O2 /openmp /TC /Focpu\ /Fecpu\sha1_search.exe cpu\sha1_search.c cpu\sha1.c
+New-Item -ItemType Directory -Force cpu\build | Out-Null
+cl /nologo /W4 /O2 /openmp /TC /Focpu\build\ /Fecpu\build\sha1_search.exe cpu\sha1_search.c cpu\sha1.c
 ```
 
 CPU usage:
 
 ```text
-cpu\sha1_search.exe <buffer-hex> <lowercase-hex-suffix> <attempts> [start-nonce] [threads]
+cpu\build\sha1_search.exe <buffer-hex> <lowercase-hex-suffix> <attempts> [start-nonce] [threads]
 ```
 
 For example, find a digest ending in `a` in a search starting at nonce zero:
 
 ```powershell
-.\cpu\sha1_search.exe 64656d6f a 1000000 0 1
-.\cpu\sha1_search.exe 64656d6f a 1000000 0 20
+.\cpu\build\sha1_search.exe 64656d6f a 1000000 0 1
+.\cpu\build\sha1_search.exe 64656d6f a 1000000 0 20
 ```
 
 The first command runs the sequential case (one thread); the second requests
@@ -68,8 +81,9 @@ digits; the buffer must be encoded as even-length lowercase hex.
 Build and run the CUDA executable:
 
 ```powershell
-nvcc -arch=sm_86 -O2 -std=c++17 -Icpu gpu\sha1_search.cu cpu\sha1.c -o gpu\sha1_search.exe
-.\gpu\sha1_search.exe 64656d6f a 1000000 0
+New-Item -ItemType Directory -Force gpu\build | Out-Null
+nvcc -arch=sm_86 -O2 -std=c++17 -Icpu gpu\sha1_search.cu cpu\sha1.c -o gpu\build\sha1_search.exe
+.\gpu\build\sha1_search.exe 64656d6f a 1000000 0
 ```
 
 Before searching, the CUDA program runs three known-answer tests on the GPU
