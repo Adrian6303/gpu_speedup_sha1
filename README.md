@@ -33,9 +33,8 @@ benchmark script or the build commands below.
 
 - Windows, Visual Studio 2022 C/C++ tools, and the NVIDIA CUDA Toolkit
 - A CUDA-capable NVIDIA GPU
-- Manual build commands require a Visual Studio Developer PowerShell terminal.
-  The benchmark script attempts to initialize MSVC automatically when it finds
-  Visual Studio and its C++ build tools; otherwise, use Developer PowerShell.
+- Run build and benchmark commands from a Visual Studio Developer PowerShell
+  terminal so the MSVC compiler environment is configured.
 
 The CUDA build below targets `sm_86` (compute capability 8.6), used by the
 GeForce RTX 3050 Ti Laptop GPU in the recorded hardware configuration. Change

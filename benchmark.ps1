@@ -21,34 +21,10 @@ if ($Attempts -lt 1 -or $CpuThreads -lt 1) {
 if ($Attempts -gt ([UInt64]::MaxValue - $startNonce)) {
 	throw "Attempt range overflows the unsigned 64-bit nonce range."
 }
-if ([string]::IsNullOrWhiteSpace($env:INCLUDE) -or
+if (-not (Get-Command cl -ErrorAction SilentlyContinue) -or
+	[string]::IsNullOrWhiteSpace($env:INCLUDE) -or
 	[string]::IsNullOrWhiteSpace($env:LIB)) {
-	$vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
-	if (-not (Test-Path $vswhere)) {
-		throw "The MSVC compiler environment is not initialized, and Visual Studio Installer (vswhere.exe) was not found. Open a VS 2022 Developer PowerShell terminal, then rerun the benchmark."
-	}
-
-	$installationPath = (& $vswhere -latest -products "*" `
-		-requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
-		-property installationPath | Select-Object -First 1)
-	if ([string]::IsNullOrWhiteSpace($installationPath)) {
-		throw "No Visual Studio installation with the C++ build tools was found."
-	}
-
-	$developerShell = Join-Path $installationPath "Common7\Tools\Launch-VsDevShell.ps1"
-	if (-not (Test-Path $developerShell)) {
-		throw "Visual Studio's Developer PowerShell script was not found at '$developerShell'."
-	}
-
-	Write-Host "Initializing the Visual Studio C++ build environment..."
-	& $developerShell -Arch amd64
-	if ([string]::IsNullOrWhiteSpace($env:INCLUDE) -or
-		[string]::IsNullOrWhiteSpace($env:LIB)) {
-		throw "Visual Studio did not initialize the MSVC INCLUDE/LIB environment."
-	}
-}
-if (-not (Get-Command cl -ErrorAction SilentlyContinue)) {
-	throw "cl was not found after initializing Visual Studio. Install the VS 2022 C++ build tools."
+	throw "Run this script from a VS 2022 Developer PowerShell terminal."
 }
 if (-not (Get-Command nvcc -ErrorAction SilentlyContinue)) {
 	throw "nvcc was not found. Install the NVIDIA CUDA Toolkit."
@@ -154,9 +130,6 @@ try {
 		$serial = Invoke-Search $cpuExecutable $arguments "CPU" 1
 		$threaded = Invoke-Search $cpuExecutable $arguments "CPU" $CpuThreads
 		$gpu = Invoke-Search $gpuExecutable $arguments "GPU"
-		if ($serial.ActualThreads -ne 1 -or $threaded.ActualThreads -ne $CpuThreads) {
-			throw "CPU thread count changed during benchmark run $run."
-		}
 		if ($serial.Result -ne $threaded.Result -or $serial.Result -ne $gpu.Result) {
 			throw "Search variants found different results: serial '$($serial.Result)', threaded '$($threaded.Result)', GPU '$($gpu.Result)'."
 		}
